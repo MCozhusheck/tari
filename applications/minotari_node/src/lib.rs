@@ -28,6 +28,7 @@ mod table;
 
 mod bootstrap;
 mod builder;
+mod checkpoints;
 pub mod cli;
 mod commands;
 pub mod config;
