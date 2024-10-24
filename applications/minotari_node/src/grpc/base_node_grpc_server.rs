@@ -622,6 +622,11 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
 
         let mut handler = self.node_service.clone();
 
+        let meta = handler
+            .get_metadata()
+            .await
+            .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e.to_string())))?;
+
         let new_template = handler
             .get_new_block_template(algo, request.max_weight)
             .await
@@ -649,6 +654,7 @@ impl tari_rpc::base_node_server::BaseNode for BaseNodeGrpcServer {
                     .map_err(|e| obscure_error_if_true(report_error_flag, Status::internal(e)))?,
             ),
             initial_sync_achieved: status_watch.borrow().bootstrapped,
+            metadata: Some(meta.into()),
         };
 
         trace!(target: LOG_TARGET, "Sending GetNewBlockTemplate response to client");

@@ -317,6 +317,7 @@ impl BlockTemplateProtocol<'_> {
             miner_data,
             new_block_template: template,
             initial_sync_achieved: _,
+            metadata: _,
         } = self
             .base_node_client
             .get_new_block_template(grpc::NewBlockTemplateRequest {
