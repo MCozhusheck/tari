@@ -1295,115 +1295,108 @@ impl wallet_server::Wallet for WalletGrpcServer {
         );
         let mut transaction_service = self.get_transaction_service();
 
-        let status_filter = if req.status_bitflag == 0 {
-            None
-        } else {
-            Some(req.status_bitflag)
-        };
-
-        let total_requested = req.limit;
-        let chunk_size = std::cmp::min(total_requested, 100); // Process in chunks of 100
-        let mut all_transactions: Vec<TransactionInfo> =
-            Vec::with_capacity(total_requested.try_into().unwrap_or(usize::MAX));
-        let mut current_offset = req.offset;
-        let mut remaining = total_requested;
-
-        // Stream data in chunks to reduce memory usage
-        while remaining > 0 {
-            let current_limit = std::cmp::min(remaining, chunk_size);
-
-            let chunk_transactions = transaction_service
-                .get_completed_transactions_paginated(current_offset, current_limit, status_filter)
+        let mut completed_transactions = transaction_service
+            .get_completed_transactions(None, None, None, 0)
+            .await
+            .map_err(|err| {
+                Status::not_found(format!(
+                    "GetAllCompletedTransactions: Error found for get_completed_transactions: {:?}",
+                    err
+                ))
+            })?;
+        completed_transactions.extend(
+            transaction_service
+                .get_cancelled_completed_transactions(0)
                 .await
                 .map_err(|err| {
                     Status::not_found(format!(
-                        "GetAllCompletedTransactions: Error found for get_completed_transactions_paginated: {:?}",
+                        "GetAllCompletedTransactions: Error found for get_cancelled_completed_transactions: {:?}",
                         err
                     ))
-                })?;
-
-            // Break if we get no more results
-            if chunk_transactions.is_empty() {
-                break;
-            }
-
-            // Process this chunk
-            for txn in chunk_transactions {
-                let output_commitments: Vec<Vec<u8>> = txn
-                    .transaction
-                    .body
-                    .outputs()
-                    .iter()
-                    .map(|o| o.commitment().as_bytes().to_vec())
-                    .collect();
-                let input_commitments: Vec<Vec<u8>> = txn
-                    .transaction
-                    .body
-                    .inputs()
-                    .iter()
-                    .map(|i| match i.commitment() {
-                        Ok(c) => c.as_bytes().to_vec(),
-                        Err(e) => {
-                            warn!(target: LOG_TARGET, "Failed to get input commitment: {}", e);
-                            vec![]
-                        },
-                    })
-                    .collect();
-
-                all_transactions.push(TransactionInfo {
-                    tx_id: txn.tx_id.into(),
-                    source_address: txn.source_address.to_vec(),
-                    dest_address: txn.destination_address.to_vec(),
-                    status: TransactionStatus::from(txn.status) as i32,
-                    amount: txn.amount.into(),
-                    is_cancelled: txn.cancelled.is_some(),
-                    direction: TransactionDirection::from(txn.direction) as i32,
-                    fee: txn.fee.into(),
-                    timestamp: txn.timestamp.timestamp() as u64,
-                    excess_sig: txn
-                        .transaction
-                        .first_kernel_excess_sig()
-                        .unwrap_or(&Signature::default())
-                        .get_signature()
-                        .to_vec(),
-                    raw_payment_id: txn.payment_id.to_bytes(),
-                    user_payment_id: txn.payment_id.payment_id_as_bytes(),
-                    mined_in_block_height: txn.mined_height.unwrap_or(0),
-                    output_commitments,
-                    input_commitments,
-                    payment_references_sent: txn
-                        .calculate_sent_payment_references()
-                        .into_iter()
-                        .map(|pr| pr.to_vec())
-                        .collect(),
-                    payment_references_received: txn
-                        .calculate_received_payment_references()
-                        .into_iter()
-                        .map(|pr| pr.to_vec())
-                        .collect(),
-                    payment_references_change: txn
-                        .calculate_change_payment_references()
-                        .into_iter()
-                        .map(|pr| pr.to_vec())
-                        .collect(),
-                });
-            }
-
-            // Update for next iteration
-            current_offset += current_limit;
-            remaining -= current_limit;
-        }
-
-        debug!(
-            target: LOG_TARGET,
-            "GetAllCompletedTransactions: Processed {} transactions in chunks",
-            all_transactions.len()
+                })?,
         );
 
+        completed_transactions.sort_by(|a, b| {
+            b.timestamp
+                .partial_cmp(&a.timestamp)
+                .expect("Should be able to compare timestamps")
+        });
+
+        let offset = usize::try_from(req.offset).unwrap_or(0);
+        let limit = if req.limit > 0 {
+            usize::try_from(req.limit).unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        let mut transactions: Vec<TransactionInfo> = Vec::new();
+        for txn in completed_transactions
+            .into_iter()
+            .filter(|tx| req.status_bitflag == 0 || (req.status_bitflag & (1 << (tx.status as u32))) != 0)
+            .skip(offset)
+            .take(limit)
+        {
+            let output_commitments: Vec<Vec<u8>> = txn
+                .transaction
+                .body
+                .outputs()
+                .iter()
+                .map(|o| o.commitment().as_bytes().to_vec())
+                .collect();
+            let input_commitments: Vec<Vec<u8>> = txn
+                .transaction
+                .body
+                .inputs()
+                .iter()
+                .map(|i| match i.commitment() {
+                    Ok(c) => c.as_bytes().to_vec(),
+                    Err(e) => {
+                        warn!(target: LOG_TARGET, "Failed to get input commitment: {}", e);
+                        vec![]
+                    },
+                })
+                .collect();
+
+            transactions.push(TransactionInfo {
+                tx_id: txn.tx_id.into(),
+                source_address: txn.source_address.to_vec(),
+                dest_address: txn.destination_address.to_vec(),
+                status: TransactionStatus::from(txn.status) as i32,
+                amount: txn.amount.into(),
+                is_cancelled: txn.cancelled.is_some(),
+                direction: TransactionDirection::from(txn.direction) as i32,
+                fee: txn.fee.into(),
+                timestamp: txn.timestamp.timestamp() as u64,
+                excess_sig: txn
+                    .transaction
+                    .first_kernel_excess_sig()
+                    .unwrap_or(&Signature::default())
+                    .get_signature()
+                    .to_vec(),
+                raw_payment_id: txn.payment_id.to_bytes(),
+                user_payment_id: txn.payment_id.payment_id_as_bytes(),
+                mined_in_block_height: txn.mined_height.unwrap_or(0),
+                output_commitments,
+                input_commitments,
+                payment_references_sent: txn
+                    .calculate_sent_payment_references()
+                    .into_iter()
+                    .map(|pr| pr.to_vec())
+                    .collect(),
+                payment_references_received: txn
+                    .calculate_received_payment_references()
+                    .into_iter()
+                    .map(|pr| pr.to_vec())
+                    .collect(),
+                payment_references_change: txn
+                    .calculate_change_payment_references()
+                    .into_iter()
+                    .map(|pr| pr.to_vec())
+                    .collect(),
+            });
+        }
+
         trace!(target: LOG_TARGET, "'GetAllCompletedTransactions' completed in {:.2?}", start.elapsed());
-        Ok(Response::new(GetAllCompletedTransactionsResponse {
-            transactions: all_transactions,
-        }))
+        Ok(Response::new(GetAllCompletedTransactionsResponse { transactions }))
     }
 
     #[allow(clippy::too_many_lines)]
